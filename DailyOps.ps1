@@ -1,19 +1,27 @@
 #requires -Version 5.1
 <#
-    Chicago Daily Ops Report - daily update
+    Chicago Daily Ops Report - daily update  (TEST VERSION: start times from the raw data + trackers)
 
     Run "Daily Ops.bat" (double-click, or drag today's files onto it).
     Type 'help' at the prompt for every command.
 
     Does what the workbook buttons did, in one go, through Excel:
-      report date + day columns, Raw Machine Data -> YEARLY DATA, start times (trackers + typed),
-      scheduled headcount, absent per shift -> present, Regular/OT/DT hours (files or .zip),
+      report date + day columns, Raw Machine Data -> YEARLY DATA, start times (raw data, trackers fill the gaps, + typed),
+      scheduled headcount, absent per shop -> present, Regular/OT/DT hours (files or .zip),
       cubic-inch pivot filter, latest-day yellow cells, formula check,
       then saves the workbook and/or the 2 pictures (Summary + All shops).
 
     Files next to this script:
-      DailyOpsConfig.xlsx   shops (sheet names, departments, tracker tabs) + settings (folders, shift starts)
-      Saved\typed.json      start times / absences you typed (re-used if you run the same day again)
+      DailyOpsConfig.xlsx   shops (sheet names, departments, asset areas) + settings (folders, shift starts)
+
+    Start times: for each machine of a shop (Assets sheet area, or the shop's one Machine #) and shift,
+      1. the Raw Machine Data: first operation logged in the shift = its start
+         (already running across the shift start = 0; up to StartEarlyMin early is looked at)
+      2. no raw value, a raw start over StartLateCap, or a NEGATIVE raw start -> the start-time
+         tracker's time for that machine, if it has one
+      3. a negative raw start with no tracker time = 0; a negative tracker time = 0
+    Shift = average of its machines; shop's day value = average of its shifts (one number).
+    Everything is also written to Output\Start times from raw data.csv for comparing.
 #>
 param(
     [Parameter(Position = 0, ValueFromRemainingArguments = $true)]
@@ -42,7 +50,7 @@ $Script:Origin     = @{}
 $Script:DefaultSettings = [ordered]@{
     ReportFolder     = @('J:\Departments\Machine\4M\KACPER', 'Where the Daily Ops Report workbook is (newest .xlsm there is offered first).')
     RawFolder        = @('',              'Where Raw Machine Data downloads land. Blank = your Downloads folder.')
-    TrackerFolder    = @('J:\Departments\Machine\4M', 'Where the machine start-time trackers are.')
+    TrackerFolder    = @('J:\Departments\Machine\4M', 'Where the machine start-time trackers are (they fill in machines the raw data has nothing for).')
     ScheduleFolder   = @('J:\Departments\Machine\SOUTH\23 Attendance\Schedules', 'Where the Hours Required schedules are.')
     HoursFolder      = @('',              'Where Shift Hours and OT Reports (or .zip of them) land. Blank = your Downloads folder.')
     OutputFolder     = @('',              'Where pictures (and copies) are saved. Blank = "Output" folder next to the script. Can be a full path.')
@@ -50,19 +58,24 @@ $Script:DefaultSettings = [ordered]@{
     Shift1Start      = @('6:00',          'Start of 1st shift (start-time minutes are counted from this).')
     Shift2Start      = @('14:00',         'Start of 2nd shift.')
     Shift3Start      = @('22:00',         'Start of 3rd shift.')
-    SaveOverOriginal = @('Yes',           'Yes = save the report workbook in place (a backup is kept). No = save a copy in the output folder.')
+    SaveOverOriginal = @('No',            'Yes = save the report workbook in place (a backup is kept). No = save a copy in the output folder (default here, so this test version doesn''t touch the real report).')
     KeepBackups      = @('5',             'How many backups of the report workbook to keep in Backups\ (0 = none).')
     FixFormulas      = @('Yes',           'Put back formulas that were typed over / broken (#REF!) in the Summary rows and the Core rows they use (Yes/No).')
     LatestDayCell    = @('Yes',           'Yellow cell right of each Performance % row uses the latest report day instead of always Friday (Yes/No).')
-    OpenWhenDone     = @('Yes',           'Open the output folder when done (Yes/No).')
+    CallInScan       = @('No',            'Yes = the absent step asks whether to scan Outlook for call-in voicemail MP3s. No = never asks.')
+    OpenWhenDone     = @('Yes',           'Open the workbook + the pictures folder when done (Yes/No).')
+    StartShifts      = @('1,2,3',         'Shifts that count for the start-time average (raw data).')
+    StartEarlyMin    = @('30',            'Raw starts up to this many minutes BEFORE the shift start are looked at; negative = tracker time for that machine, else 0.')
+    StartLateCap     = @('120',           'Raw first start later than this many minutes is not used (late logging / idle): tracker time if it has the machine, else left out.')
     OutlookSubject   = @('Shift Hours and OT Report', 'Hours step also looks in Outlook (Inbox + its subfolders) for emails with this in the subject and takes their attachments. Blank = off.')
+    PageFolder       = @('',              'Folder on J: for the Daily Ops web page (index.html + the 2 pictures). Blank = off.')
 }
 
 $Script:DefaultShops = @(
-    [pscustomobject]@{ Code = 'HMS';    Label = 'HMS';     Sheet = 'Core Machining_HMS';     TrackerTab = 'HMS';     Dept = 153; Machine = 0;     SchedOnly = '';    SchedExcept = '';    FileWords = 'HMS' },
-    [pscustomobject]@{ Code = 'MMS';    Label = 'MMS';     Sheet = 'Core Machining_MMS';     TrackerTab = 'MMS';     Dept = 154; Machine = 0;     SchedOnly = '';    SchedExcept = '';    FileWords = 'MMS' },
-    [pscustomobject]@{ Code = 'LMSSMS'; Label = 'LMS-SMS'; Sheet = 'Core Machining_LMS-SMS'; TrackerTab = 'SMS_FEL'; Dept = 145; Machine = 0;     SchedOnly = '';    SchedExcept = '175'; FileWords = 'SMS,LMS,FEL' },
-    [pscustomobject]@{ Code = 'FEL';    Label = 'FEL';     Sheet = 'Core Machining_FEL';     TrackerTab = 'SMS_FEL'; Dept = 175; Machine = 10177; SchedOnly = '175'; SchedExcept = '';    FileWords = 'SMS,LMS,FEL' }
+    [pscustomobject]@{ Code = 'HMS';    Label = 'HMS';     Sheet = 'Core Machining_HMS';     TrackerTab = 'HMS';     Dept = 153; Machine = 0;     SchedOnly = '';    SchedExcept = '';    FileWords = 'HMS';         Areas = 'HMS' },
+    [pscustomobject]@{ Code = 'MMS';    Label = 'MMS';     Sheet = 'Core Machining_MMS';     TrackerTab = 'MMS';     Dept = 154; Machine = 0;     SchedOnly = '';    SchedExcept = '';    FileWords = 'MMS';         Areas = 'MMS' },
+    [pscustomobject]@{ Code = 'LMSSMS'; Label = 'LMS-SMS'; Sheet = 'Core Machining_LMS-SMS'; TrackerTab = 'SMS_FEL'; Dept = 145; Machine = 0;     SchedOnly = '';    SchedExcept = '175'; FileWords = 'SMS,LMS,FEL'; Areas = 'LMS,SMS' },
+    [pscustomobject]@{ Code = 'FEL';    Label = 'FEL';     Sheet = 'Core Machining_FEL';     TrackerTab = 'SMS_FEL'; Dept = 175; Machine = 10177; SchedOnly = '175'; SchedExcept = '';    FileWords = 'SMS,LMS,FEL'; Areas = 'FEL' }
 )
 
 Add-Type -AssemblyName System.IO.Compression
@@ -400,10 +413,15 @@ function Get-Config {
                 Dept = (ConvertTo-IntSafe $r['Dept']); Machine = (ConvertTo-IntSafe $r['Machine'])
                 SchedOnly = "$($r['SchedOnly'])".Trim(); SchedExcept = "$($r['SchedExcept'])".Trim()
                 FileWords = "$($r['FileWords'])".Trim()
+                Areas = "$($r['Areas'])".Trim()
             })
     }
     if ($cfg.Shops.Count -eq 0) { foreach ($s in $Script:DefaultShops) { [void]$cfg.Shops.Add($s) } }
+    foreach ($s in $cfg.Shops) {                                                 # older config without the Areas column
+        if (-not $s.Areas) { $d = @($Script:DefaultShops | Where-Object { $_.Code -eq $s.Code }); if ($d.Count -gt 0) { $s.Areas = $d[0].Areas } else { $s.Areas = $s.Label } }
+    }
     foreach ($k in $Script:DefaultSettings.Keys) { $cfg.Settings[$k] = $Script:DefaultSettings[$k][0] }
+    $inFile = @{}
     foreach ($r in (Get-SheetTable $book 'Settings')) {
         $k = "$($r['Setting'])".Trim()
         if ($k -eq '') { continue }
@@ -411,6 +429,11 @@ function Get-Config {
         foreach ($dk in @($cfg.Settings.Keys)) { if ($dk -ieq $k) { $match = $dk } }
         if ($null -eq $match) { $match = $k }
         $cfg.Settings[$match] = "$($r['Value'])".Trim()
+        $inFile[$match] = $true
+    }
+    $new = @($Script:DefaultSettings.Keys | Where-Object { -not $inFile.ContainsKey($_) })
+    if ($new.Count -gt 0) {                                   # settings added in a newer script -> put them in the config file
+        try { Save-Config $cfg; Say "  Added to $([IO.Path]::GetFileName($Script:ConfigPath)): $($new -join ', ')" DarkGray } catch { }
     }
     return $cfg
 }
@@ -419,7 +442,7 @@ function Save-Config($Cfg) {
     $shopRows = New-Object System.Collections.ArrayList
     foreach ($s in $Cfg.Shops) {
         $m = ''; if ($s.Machine -gt 0) { $m = $s.Machine }
-        [void]$shopRows.Add(@($s.Code, $s.Label, $s.Sheet, $s.TrackerTab, $s.Dept, $m, $s.SchedOnly, $s.SchedExcept, $s.FileWords))
+        [void]$shopRows.Add(@($s.Code, $s.Label, $s.Sheet, $s.TrackerTab, $s.Dept, $m, $s.SchedOnly, $s.SchedExcept, $s.FileWords, $s.Areas))
     }
     $setRows = New-Object System.Collections.ArrayList
     foreach ($k in $Cfg.Settings.Keys) {
@@ -431,7 +454,7 @@ function Save-Config($Cfg) {
         @{ Name = 'Shops'; Rows = $shopRows
             Columns = @(@{ Header = 'Code'; Width = 9 }, @{ Header = 'Label'; Width = 10 }, @{ Header = 'Sheet'; Width = 26 }, @{ Header = 'TrackerTab'; Width = 12 },
                 @{ Header = 'Dept'; Width = 7; Numeric = $true }, @{ Header = 'Machine'; Width = 9; Numeric = $true }, @{ Header = 'SchedOnly'; Width = 11 },
-                @{ Header = 'SchedExcept'; Width = 12 }, @{ Header = 'FileWords'; Width = 14 })
+                @{ Header = 'SchedExcept'; Width = 12 }, @{ Header = 'FileWords'; Width = 14 }, @{ Header = 'Areas'; Width = 12 })
         },
         @{ Name = 'Settings'; Rows = $setRows
             Columns = @(@{ Header = 'Setting'; Width = 18 }, @{ Header = 'Value'; Width = 52 }, @{ Header = 'Notes'; Width = 90; Wrap = $true })
@@ -678,6 +701,261 @@ function Get-DayIndex([string]$Tok) {
 }
 
 #endregion
+#region ---------- start times from the raw machine data ----------
+
+$Script:RawTimeFormats = [string[]]@('M/d/yyyy h:mm:ss tt', 'M/d/yyyy h:mm tt', 'M/d/yyyy H:mm:ss', 'M/d/yyyy H:mm', 'yyyy-MM-dd HH:mm:ss', 'yyyy-MM-dd H:mm')
+
+# Start / End Time cell -> [datetime] (text like '9/8/2026 9:20:00 AM' or an Excel date number)
+function ConvertTo-RawTime($v) {
+    if ($null -eq $v) { return $null }
+    if ($v -is [psobject]) { $v = $v.psobject.BaseObject }
+    if ($v -is [datetime]) { return $v }
+    if ($v -is [double]) { if ($v -gt 1) { return [datetime]::FromOADate($v) }; return $null }
+    $t = "$v".Trim()
+    if ($t -eq '') { return $null }
+    $d = [datetime]::MinValue
+    if ([datetime]::TryParseExact($t, $Script:RawTimeFormats, $Script:US, [Globalization.DateTimeStyles]::AllowWhiteSpaces, [ref]$d)) { return $d }
+    if ([datetime]::TryParse($t, $Script:US, [Globalization.DateTimeStyles]::None, [ref]$d)) { return $d }
+    return $null
+}
+
+# machine number as text: 10307, '10307', 10307.0 -> '10307'
+function ConvertTo-MachineKey($v) {
+    if ($null -eq $v) { return '' }
+    if ($v -is [psobject]) { $v = $v.psobject.BaseObject }
+    if ($v -is [double] -or $v -is [int] -or $v -is [long]) { $x = [double]$v; if ($x -eq [math]::Floor($x)) { return ([long]$x).ToString($Script:Inv) }; return $x.ToString($Script:Inv) }
+    $t = "$v".Trim(); $n = 0.0
+    if ([double]::TryParse($t, [Globalization.NumberStyles]::Float, $Script:Inv, [ref]$n) -and $n -eq [math]::Floor($n)) { return ([long]$n).ToString($Script:Inv) }
+    return $t
+}
+
+function ConvertTo-Array1($v) {
+    if ($v -is [array]) { return , $v }
+    $a = [Array]::CreateInstance([object], @(1, 1), @(1, 1)); $a[1, 1] = $v
+    return , $a
+}
+
+# columns D (Tool), K (Start Time), L (End Time) of a raw-data sheet from FirstRow down
+function Read-RawColumns($Ws, [int]$FirstRow) {
+    $last = $Ws.Cells.Item($Ws.Rows.Count, 11).End(-4162).Row                   # last Start Time (xlUp)
+    $n = $last - $FirstRow + 1
+    if ($n -lt 1) { return [pscustomobject]@{ N = 0; Tool = $null; Start = $null; End = $null } }
+    return [pscustomobject]@{
+        N     = $n
+        Tool  = (ConvertTo-Array1 $Ws.Range("D${FirstRow}:D$last").Value2)
+        Start = (ConvertTo-Array1 $Ws.Range("K${FirstRow}:K$last").Value2)
+        End   = (ConvertTo-Array1 $Ws.Range("L${FirstRow}:L$last").Value2)
+    }
+}
+
+# -> hashtable machine -> list of @(start, end) for operations touching [From, To)
+function Get-RawOps($Cols, [datetime]$From, [datetime]$To) {
+    $ops = @{}
+    if ($null -eq $Cols -or $Cols.N -lt 1) { return $ops }
+    $t0 = $Cols.Tool.GetLowerBound(0); $s0 = $Cols.Start.GetLowerBound(0); $e0 = $Cols.End.GetLowerBound(0)
+    $tc = $Cols.Tool.GetLowerBound(1); $sc = $Cols.Start.GetLowerBound(1); $ec = $Cols.End.GetLowerBound(1)
+    for ($i = 0; $i -lt $Cols.N; $i++) {
+        $st = ConvertTo-RawTime $Cols.Start[($s0 + $i), $sc]
+        if ($null -eq $st -or $st -ge $To) { continue }
+        $en = ConvertTo-RawTime $Cols.End[($e0 + $i), $ec]
+        if ($null -eq $en) { if ($st -lt $From) { continue } }
+        elseif ($en -lt $From) { continue }
+        $k = ConvertTo-MachineKey $Cols.Tool[($t0 + $i), $tc]
+        if ($k -eq '') { continue }
+        if (-not $ops.ContainsKey($k)) { $ops[$k] = New-Object System.Collections.ArrayList }
+        [void]$ops[$k].Add(@($st, $en))
+    }
+    return $ops
+}
+
+# Assets sheet of the report workbook: A = machine #, C = Area/Department
+function Get-AssetAreas($G) {
+    $areas = @{}
+    for ($r = $G.R1; $r -le (Get-LastRow $G); $r++) {
+        $k = ConvertTo-MachineKey (GridV $G $r 1); $a = "$(GridV $G $r 3)".Trim()
+        if ($k -ne '' -and $a -ne '' -and -not $areas.ContainsKey($k)) { $areas[$k] = $a }
+    }
+    return $areas
+}
+
+# the shop's machines: its one Machine # if set (FEL = 10177), else every asset whose area is in Areas
+function Get-ShopMachines($Shop, $Areas) {
+    if ($Shop.Machine -gt 0) { return @("$($Shop.Machine)") }
+    $want = @("$($Shop.Areas)" -split '[,;]+' | ForEach-Object { $_.Trim().ToUpper() } | Where-Object { $_ -ne '' })
+    return @($Areas.Keys | Where-Object { $want -contains $Areas[$_].ToUpper() } | Sort-Object)
+}
+
+# Does a machine on a tracker tab count for this shop? Its own Machine # if it has one; on a tab two shops
+# share (SMS_FEL) the Assets area decides; on a shop's own tab every machine listed counts.
+function Test-TrackerMachine($Shop, [string]$Machine, $Shops, $Areas) {
+    if ($Shop.Machine -gt 0) { return ($Machine -eq "$($Shop.Machine)") }
+    $sharing = @($Shops | Where-Object { $_.TrackerTab -ieq $Shop.TrackerTab -and $_.Code -ne $Shop.Code })
+    if (@($sharing | Where-Object { $_.Machine -gt 0 -and "$($_.Machine)" -eq $Machine }).Count -gt 0) { return $false }
+    if ($sharing.Count -eq 0) { return $true }
+    if (-not $Areas.ContainsKey($Machine)) { return $true }
+    $want = @("$($Shop.Areas)" -split '[,;]+' | ForEach-Object { $_.Trim().ToUpper() } | Where-Object { $_ -ne '' })
+    return ($want -contains $Areas[$Machine].ToUpper())
+}
+
+# Per-machine times from the start-time trackers -> @{ "day|shift|machine" = minutes } for one shop
+# (minutes after the shift start; a 3rd-shift time after midnight counts for the evening before)
+function Get-TrackerMachineTimes($Trackers, $Shop, $Shops, $Areas, [datetime]$Monday, $ShiftStarts) {
+    $sum = @{}; $cnt = @{}; $mon = Get-Serial $Monday
+    foreach ($f in $Trackers) {
+        if ($f.Shops -notcontains $Shop.Code) { continue }
+        $sh = Get-BookSheet $f.Book $Shop.TrackerTab
+        if ($null -eq $sh) { continue }
+        $g = Get-SheetGrid $sh
+        $avgRow = Find-InCol $g 1 1 (Get-LastRow $g) 'AVG Start time'
+        if ($avgRow -eq 0) { continue }
+        $dateRow = 0
+        for ($r = $avgRow + 1; $r -le $avgRow + 10; $r++) { if (Test-DateValue (GridV $g $r 2)) { $dateRow = $r; break } }
+        if ($dateRow -eq 0) { continue }
+        $startT = $ShiftStarts[$f.Shift]
+        $cols = @(); for ($d = 0; $d -lt 7; $d++) { $cols += (Match-InRow $g $dateRow ($mon + $d)) }
+        for ($r = $g.R1; $r -lt $avgRow; $r++) {
+            $m = ConvertTo-MachineKey (GridV $g $r 1)
+            if ($m -eq '' -or $m -notmatch '^\d+$') { continue }
+            if (-not (Test-TrackerMachine $Shop $m $Shops $Areas)) { continue }
+            for ($d = 0; $d -lt 7; $d++) {
+                if ($cols[$d] -eq 0) { continue }
+                $v = GridV $g $r $cols[$d]
+                if ($v -isnot [double]) { continue }
+                $mins = ($v - [math]::Floor($v) - $startT) * 1440
+                if ($mins -lt -720) { $mins += 1440 }
+                $k = "$d|$($f.Shift)|$m"
+                if ($sum.ContainsKey($k)) { $sum[$k] += $mins; $cnt[$k]++ } else { $sum[$k] = $mins; $cnt[$k] = 1 }
+            }
+        }
+    }
+    $out = @{}; foreach ($k in $sum.Keys) { $out[$k] = $sum[$k] / $cnt[$k] }
+    return $out
+}
+
+# Raw data first, the tracker fills the holes, negatives -> 0. One number per day.
+#   per machine & shift:  raw >= 0 (or already running = 0)          -> raw
+#                         raw negative                                -> tracker if it has the machine, else 0
+#                         no raw / raw over the cap                   -> tracker if it has the machine (else nothing / left out)
+#                         tracker negative                            -> 0
+#   shift = average of its machines; day = average of the shifts
+# -> @{ Values = 7 x (minutes | $null); Shifts = per day/shift summary; Machines = per machine rows }
+function Get-RawStartTimes($Ops, $Machines, $Week, $ShiftStarts, [int[]]$Shifts, [int]$Early, [int]$Cap, $Trk) {
+    if ($null -eq $Trk) { $Trk = @{} }
+    $all = @($Machines)
+    foreach ($k in $Trk.Keys) { $m = ($k -split '\|')[2]; if ($all -notcontains $m) { $all += $m } }
+    $shiftList = @($Shifts)
+    foreach ($k in $Trk.Keys) { $x = [int](($k -split '\|')[1]); if ($shiftList -notcontains $x) { $shiftList += $x } }
+    $shiftList = @($shiftList | Sort-Object)
+    $values = @(); $sum = New-Object System.Collections.ArrayList; $rows = New-Object System.Collections.ArrayList
+    for ($d = 0; $d -lt 7; $d++) {
+        if ($d -ge $Week.Days) { $values += $null; continue }
+        $day = $Week.Monday.AddDays($d)
+        $avgs = @()
+        foreach ($sh in $shiftList) {
+            $ws = $day.AddMinutes([math]::Round($ShiftStarts[$sh] * 1440))      # 3rd shift = the evening of this day
+            $we = $ws.AddHours(8); $lo = $ws.AddMinutes(-$Early)
+            $mins = @(); $late = 0; $running = 0; $nRaw = 0; $nTrk = 0
+            foreach ($m in $all) {
+                $rawV = $null; $rawNote = ''
+                if ($Shifts -contains $sh -and $Ops.ContainsKey($m)) {
+                    $isRun = $false; $first = $null
+                    foreach ($o in $Ops[$m]) {
+                        $st = $o[0]; $en = $o[1]
+                        if ($st -lt $ws -and $null -ne $en -and $en -gt $ws) { $isRun = $true; break }
+                        if ($st -ge $lo -and $st -lt $we -and ($null -eq $first -or $st -lt $first)) { $first = $st }
+                    }
+                    if ($isRun) { $rawV = 0.0; $rawNote = 'running' }
+                    elseif ($null -ne $first) { $rawV = ($first - $ws).TotalMinutes }
+                }
+                $tk = "$d|$sh|$m"; $trkV = $null; if ($Trk.ContainsKey($tk)) { $trkV = [double]$Trk[$tk] }
+                $use = $null; $src = ''; $note = ''
+                if ($null -ne $rawV -and $rawV -ge 0 -and $rawV -le $Cap) { $use = $rawV; $src = 'raw'; if ($rawNote) { $note = 'already running' } }
+                elseif ($null -ne $rawV -and $rawV -lt 0) {
+                    if ($null -ne $trkV) { $use = $trkV; $src = 'tracker'; $note = "raw was $([int][math]::Round($rawV)) (negative)" }
+                    else { $use = 0.0; $src = 'raw'; $note = "negative ($([int][math]::Round($rawV))) -> 0" }
+                }
+                elseif ($null -ne $trkV) { $use = $trkV; $src = 'tracker'; if ($null -ne $rawV) { $note = "raw was $([int][math]::Round($rawV)) (over $Cap)" } }
+                elseif ($null -ne $rawV) { $late++; [void]$rows.Add([pscustomobject]@{ Date = $day; Shift = $sh; Machine = $m; Minutes = [int][math]::Round($rawV); Source = 'raw'; Note = "left out (over $Cap min)" }); continue }
+                else { continue }
+                if ($use -lt 0) { $n2 = "tracker $([int][math]::Round($use)) (negative) -> 0"; if ($note) { $note = "$note; $n2" } else { $note = $n2 }; $use = 0.0 }
+                if ($src -eq 'raw') { $nRaw++ } else { $nTrk++ }
+                if ($note -eq 'already running') { $running++ }
+                $mins += $use
+                [void]$rows.Add([pscustomobject]@{ Date = $day; Shift = $sh; Machine = $m; Minutes = [int][math]::Round($use); Source = $src; Note = $note })
+            }
+            $avg = $null
+            if ($mins.Count -gt 0) { $avg = ($mins | Measure-Object -Sum).Sum / $mins.Count; $avgs += $avg }
+            [void]$sum.Add([pscustomobject]@{ Date = $day; Shift = $sh; Machines = $mins.Count; Raw = $nRaw; Tracker = $nTrk; Avg = $avg; LeftOut = $late; Running = $running })
+        }
+        if ($avgs.Count -gt 0) { $values += [int][math]::Round((($avgs | Measure-Object -Sum).Sum / $avgs.Count), 0) } else { $values += $null }
+    }
+    return [pscustomobject]@{ Values = $values; Shifts = $sum; Machines = $rows }
+}
+
+function Show-RawShiftTable($Shops, $Raw, $Week) {
+    $line = '  {0,-9}{1,-8}' -f 'by shift', ''
+    for ($d = 0; $d -lt $Week.Days; $d++) { $line += '{0,-13}' -f (Format-Day $Week.Monday.AddDays($d)) }
+    Say $line DarkGray
+    foreach ($s in $Shops) {
+        $r = $Raw[$s.Code]; if ($null -eq $r) { continue }
+        $first = $true
+        foreach ($sh in @($r.Shifts | ForEach-Object { $_.Shift } | Select-Object -Unique)) {
+            $lbl = ''; if ($first) { $lbl = $s.Label }; $first = $false
+            $line = '  {0,-9}{1,-8}' -f $lbl, $Script:ShiftNames[$sh - 1]
+            for ($d = 0; $d -lt $Week.Days; $d++) {
+                $x = @($r.Shifts | Where-Object { $_.Shift -eq $sh -and $_.Date -eq $Week.Monday.AddDays($d) })[0]
+                $t = '.'
+                if ($x -and ($null -ne $x.Avg -or $x.LeftOut -gt 0)) {
+                    $avg = '.'; if ($null -ne $x.Avg) { $avg = [int][math]::Round($x.Avg) }
+                    $n = "$($x.Raw)"; if ($x.Tracker -gt 0) { $n += "+$($x.Tracker)t" }
+                    if ($x.LeftOut -gt 0) { $n += "|$($x.LeftOut)" }
+                    $t = "$avg ($n)"
+                }
+                $line += '{0,-13}' -f $t
+            }
+            Say $line DarkGray
+        }
+    }
+    Say "  minutes late (raw machines + Nt from the tracker | left out: raw over the StartLateCap, no tracker)" DarkGray
+}
+
+# cumulative comparison log + per-machine detail of this run
+function Write-RawStartLog($Cfg, $Shops, $Raw, $Week, $Typed) {
+    $root = Get-OutputRoot $Cfg
+    New-Item -ItemType Directory -Force -Path $root | Out-Null
+    $log = Join-Path $root 'Start times from raw data.csv'
+    $new = @()
+    foreach ($s in $Shops) {
+        $r = $Raw[$s.Code]; if ($null -eq $r) { continue }
+        foreach ($x in $r.Shifts) {
+            $d = [int]($x.Date - $Week.Monday).TotalDays
+            $typedV = ''; $k = Get-TypedKey $s $x.Date; if ($Typed.Start.ContainsKey($k)) { $typedV = "$($Typed.Start[$k])" }
+            $avg = ''; if ($null -ne $x.Avg) { $avg = [math]::Round($x.Avg, 1).ToString($Script:Inv) }
+            $dv = ''; if ($null -ne $r.Values[$d]) { $dv = "$($r.Values[$d])" }
+            $new += [pscustomobject]@{ Date = $x.Date.ToString('yyyy-MM-dd'); Day = $Script:DayAbbr[$d]; Shop = $s.Label; Shift = $Script:ShiftNames[$x.Shift - 1]
+                Machines = $x.Machines; FromRaw = $x.Raw; FromTracker = $x.Tracker; AvgMinutes = $avg; LeftOut = $x.LeftOut; AlreadyRunning = $x.Running; ShopDayValue = $dv; Typed = $typedV; Updated = (Get-Date).ToString('yyyy-MM-dd HH:mm') }
+        }
+    }
+    try {
+        $keys = @{}; foreach ($n in $new) { $keys["$($n.Date)|$($n.Shop)|$($n.Shift)"] = $true }
+        $old = @(); if (Test-Path -LiteralPath $log) { $old = @(Import-Csv -LiteralPath $log | Where-Object { -not $keys.ContainsKey("$($_.Date)|$($_.Shop)|$($_.Shift)") }) }
+        @($old + $new) | Sort-Object Date, Shop, Shift | Export-Csv -LiteralPath $log -NoTypeInformation -Encoding UTF8
+    }
+    catch { Warn "Couldn't update $log (open in Excel?): $($_.Exception.Message)" }
+    try {
+        $dir = Join-Path $root $Week.Report.ToString('yyyy-MM-dd', $Script:Inv)
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        $det = Join-Path $dir ("Start times by machine {0}.csv" -f $Week.Report.ToString('yyyy-MM-dd', $Script:Inv))
+        $rows = @()
+        foreach ($s in $Shops) { $r = $Raw[$s.Code]; if ($null -eq $r) { continue }; foreach ($m in $r.Machines) { $rows += [pscustomobject]@{ Date = $m.Date.ToString('yyyy-MM-dd'); Shop = $s.Label; Shift = $Script:ShiftNames[$m.Shift - 1]; Machine = $m.Machine; Minutes = $m.Minutes; Source = $m.Source; Note = $m.Note } } }
+        $rows | Sort-Object Date, Shop, Shift, Machine | Export-Csv -LiteralPath $det -NoTypeInformation -Encoding UTF8
+    }
+    catch { Warn "Couldn't write the per-machine start times: $($_.Exception.Message)" }
+    Say "  Start times logged to $log" DarkGray
+}
+
+#endregion
+
 #region ---------- Outlook ----------
 
 # Runs in its own PowerShell (a job) so a stuck Outlook can't hang the script. Saves the Excel attachments
@@ -1080,7 +1358,9 @@ function Get-TypedKey($Shop, [datetime]$Day) { return ($Shop.Code + '|' + $Day.T
 
 function Start-Excel {
     Say '  Starting Excel...' DarkGray
+    $before = @(Get-Process -Name EXCEL -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
     $xl = New-Object -ComObject Excel.Application
+    $Script:XlPids = @(Get-Process -Name EXCEL -ErrorAction SilentlyContinue | Where-Object { $before -notcontains $_.Id } | ForEach-Object { $_.Id })
     $xl.Visible = $false
     $xl.DisplayAlerts = $false
     $xl.ScreenUpdating = $false
@@ -1441,32 +1721,47 @@ function Show-StartGrid($Shops, $Grid, $Week) {
     }
 }
 
+# total absent for a shop/day (older saved entries were per shift - they're added up)
+function Get-AbsentTotal($A) {
+    $v = @($A | Where-Object { $null -ne $_ })
+    if ($v.Count -eq 0) { return $null }
+    return [int](($v | Measure-Object -Sum).Sum)
+}
+
 function Show-AbsentGrid($Shops, $Absent, $Sched, $Week) {
-    $line = '  {0,-9}{1,-8}' -f 'absent', ''
+    $line = '  {0,-17}' -f 'absent'
     for ($d = 0; $d -lt $Week.Days; $d++) { $line += '{0,-10}' -f (Format-Day $Week.Monday.AddDays($d)) }
     Say $line White
     foreach ($s in $Shops) {
-        for ($k = 0; $k -lt 3; $k++) {
-            $lbl = ''; if ($k -eq 0) { $lbl = $s.Label }
-            $line = '  {0,-9}{1,-8}' -f $lbl, $Script:ShiftNames[$k]
-            for ($d = 0; $d -lt $Week.Days; $d++) {
-                $a = $Absent[(Get-TypedKey $s $Week.Monday.AddDays($d))]
-                $txt = '.'; if ($a -and $null -ne $a[$k]) { $txt = "$($a[$k])" }
-                $line += '{0,-10}' -f $txt
-            }
-            Say $line
-        }
-        $line = '  {0,-9}{1,-8}' -f '', 'present'
+        $line = '  {0,-17}' -f $s.Label
+        $line2 = '  {0,-17}' -f '  present/sched'
         for ($d = 0; $d -lt $Week.Days; $d++) {
+            $t = Get-AbsentTotal $Absent[(Get-TypedKey $s $Week.Monday.AddDays($d))]
             $sch = $Sched[$s.Code][$d]
-            $a = $Absent[(Get-TypedKey $s $Week.Monday.AddDays($d))]
+            $line += '{0,-10}' -f $(if ($null -ne $t) { "$t" } else { '.' })
             $sTxt = '-'; if ($sch -is [double] -or $sch -is [int]) { $sTxt = "$sch" }
-            $pTxt = '-'
-            if ($a -and @($a | Where-Object { $null -ne $_ }).Count -gt 0 -and ($sch -is [double] -or $sch -is [int])) { $pTxt = "$($sch - (($a | Where-Object { $null -ne $_ } | Measure-Object -Sum).Sum))" }
-            $line += '{0,-10}' -f "$pTxt/$sTxt"
+            $pTxt = '-'; if ($null -ne $t -and ($sch -is [double] -or $sch -is [int])) { $pTxt = "$($sch - $t)" }
+            $line2 += '{0,-10}' -f "$pTxt/$sTxt"
         }
-        Say $line DarkGray
+        Say $line
+        Say $line2 DarkGray
     }
+}
+
+# After a run: the pictures folder in Explorer + the saved workbook in Excel (once the hidden Excel has closed,
+# so the workbook doesn't open inside it).
+function Open-WhenDone([string]$Workbook, [string]$Folder) {
+    if ($Folder -and (Test-Path -LiteralPath $Folder)) {
+        try { Start-Process -FilePath 'explorer.exe' -ArgumentList ('"' + $Folder + '"') } catch { try { Invoke-Item -LiteralPath $Folder } catch { } }
+    }
+    if (-not $Workbook -or -not (Test-Path -LiteralPath $Workbook)) { return }
+    $ids = @($Script:XlPids | Where-Object { $_ })
+    if ($ids.Count -gt 0) {
+        try { Wait-Process -Id $ids -Timeout 15 -ErrorAction SilentlyContinue } catch { }
+        foreach ($id in $ids) { try { Stop-Process -Id $id -Force -ErrorAction SilentlyContinue } catch { } }   # ours, already closed + saved
+    }
+    Say "  Opening $([IO.Path]::GetFileName($Workbook))..." DarkGray
+    try { Invoke-Item -LiteralPath $Workbook } catch { Say "  Couldn't open the workbook: $($_.Exception.Message)" Yellow }
 }
 
 function Invoke-Report([string[]]$InputPaths, [switch]$PicturesOnly) {
@@ -1490,7 +1785,7 @@ function Invoke-Report([string[]]$InputPaths, [switch]$PicturesOnly) {
     }
 
     $nSteps = 8; if ($PicturesOnly) { $nSteps = 1 }
-    $xl = $null; $wb = $null
+    $xl = $null; $wb = $null; $openWb = $null; $openDir = $null
     $work = Join-Path ([IO.Path]::GetTempPath()) ('DailyOps_' + [guid]::NewGuid().ToString('N').Substring(0, 8))
     New-Item -ItemType Directory -Force -Path $work | Out-Null
     try {
@@ -1544,7 +1839,7 @@ function Invoke-Report([string[]]$InputPaths, [switch]$PicturesOnly) {
             $found = @(Find-Files $rawDir @('*raw*machine*data*.xls*') $days | Select-Object -First 5)
             $rawPath = @(Select-Files -What 'Raw Machine Data file' -Kind 'raw' -Found $found -Drop $drop -Folder $rawDir -SkipText 'Skip - keep the data already in YEARLY DATA') | Select-Object -First 1
 
-            Head "STEP 4 of $nSteps - Machine start times"
+            Head "STEP 4 of $nSteps - Machine start times (raw data first, trackers fill the gaps)"
             $trDir = Get-Folder $cfg 'TrackerFolder'
             $all = @(Find-Files $trDir @('*start*time*.xls*') 0 1)
             $found = @(); $seen = @{}
@@ -1556,7 +1851,7 @@ function Invoke-Report([string[]]$InputPaths, [switch]$PicturesOnly) {
                 $seen[$key] = $true; $found += $f
             }
             $found = @($found | Select-Object -First 12)
-            $trackPaths = @(Select-Files -What 'start-time trackers (1st / 2nd / 3rd shift, all shops)' -Kind 'tracker' -Found $found -Drop $drop -Folder $trDir -Multi -AllByDefault -SkipText 'None - type them / keep what''s in the workbook')
+            $trackPaths = @(Select-Files -What 'start-time trackers (they only fill in machines with no raw data)' -Kind 'tracker' -Found $found -Drop $drop -Folder $trDir -Multi -AllByDefault -SkipText 'None - raw data only')
             $trackers = @()
             foreach ($p in $trackPaths) {
                 Say "  Reading $([IO.Path]::GetFileName($p))" DarkGray
@@ -1565,35 +1860,58 @@ function Invoke-Report([string[]]$InputPaths, [switch]$PicturesOnly) {
                 if ($ids.Count -eq 0) { Warn "$($b.Name): no shop tab - skipped"; Close-InputBook $b; continue }
                 $trackers += [pscustomobject]@{ Book = $b; Shift = (Get-ShiftOfName $p); Shops = $ids }
             }
+            $rawCols = $null
+            if ($rawPath) {
+                Say "  Reading start times from $([IO.Path]::GetFileName($rawPath))..." DarkGray
+                try {
+                    $rb = Open-InputBook $xl $rawPath $work
+                    try { $rawCols = Read-RawColumns $rb.Sheets[0].Ws 2 } finally { Close-InputBook $rb }
+                }
+                catch { Warn "Couldn't read the raw data file for start times: $($_.Exception.Message)" }
+            }
+            else {
+                Say '  No raw file picked - using the data already in YEARLY DATA...' DarkGray
+                try { $ydWs = Get-WbSheet $wb $Script:YEARLY; $rawCols = Read-RawColumns $ydWs 4 } catch { Warn "Couldn't read YEARLY DATA for start times: $($_.Exception.Message)" }
+            }
+            $ops = Get-RawOps $rawCols $week.Monday.AddDays(-1) $week.Monday.AddDays(8)
+            $assetWs = Get-WbSheet $wb 'Assets'
+            $areas = @{}; if ($assetWs) { $areas = Get-AssetAreas (Get-ComGrid $assetWs) } else { Warn "No 'Assets' sheet in the workbook - can't tell which machines belong to which shop." }
+            $rShifts = @("$(Get-Setting $cfg 'StartShifts')" -split '[,;\s]+' | Where-Object { $_ -match '^[123]$' } | ForEach-Object { [int]$_ })
+            if ($rShifts.Count -eq 0) { $rShifts = @(1, 2, 3) }
+            $rawStart = @{}
+            foreach ($s in $shops) {
+                $mach = @(Get-ShopMachines $s $areas)
+                $trk = Get-TrackerMachineTimes $trackers $s $shops $areas $week.Monday $starts
+                $rawStart[$s.Code] = Get-RawStartTimes $ops $mach $week $starts $rShifts (Get-SettingInt $cfg 'StartEarlyMin' 30) (Get-SettingInt $cfg 'StartLateCap' 120) $trk
+                $rawStart[$s.Code] | Add-Member -NotePropertyName MachineCount -NotePropertyValue ($mach.Count + $trk.Count) -Force
+                $rawStart[$s.Code] | Add-Member -NotePropertyName TrackerCount -NotePropertyValue $trk.Count -Force
+            }
+            foreach ($t in $trackers) { Close-InputBook $t.Book }
+            Say ("  {0} operations this week on {1} machines" -f (@($ops.Values | ForEach-Object { $_.Count }) | Measure-Object -Sum).Sum, $ops.Count) DarkGray
             $startGrid = @{}
             foreach ($s in $shops) {
                 $g = $core[$s.Code].Grid
                 $row = Find-InCol $g 3 1 (Get-LastRow $g) 'Average time to start tool'
-                $mine = @($trackers | Where-Object { $_.Shops -contains $s.Code })
-                if ($mine.Count -gt 0) {
-                    $st = Get-StartTimes $mine $s $week.Monday $starts
-                    $base = @($st.Values | ForEach-Object { if ($null -eq $_) { 'N/A' } else { $_ } })
-                    $src = 'tracker'; $notes = $st.Notes
-                    $shiftTxt = (@($mine | ForEach-Object { $Script:ShiftNames[$_.Shift - 1] } | Select-Object -Unique) -join '+')
-                    $src = "tracker $shiftTxt"
-                }
-                else {
-                    $base = @(); for ($d = 0; $d -lt 7; $d++) { $v = $null; if ($row -gt 0) { $v = GridV $g $row (8 + 2 * $d) }; if ($v -is [double]) { $v = [math]::Round($v, 0) }; $base += $v }
-                    $src = 'in workbook'; $notes = @()
-                }
+                $r = $rawStart[$s.Code]
+                $haveData = ($r.TrackerCount -gt 0 -or ($r.MachineCount -gt 0 -and $ops.Count -gt 0))
+                $base = @($r.Values | ForEach-Object { if ($null -eq $_) { 'N/A' } else { $_ } })
+                $src = 'raw'; if ($r.TrackerCount -gt 0) { $src = 'raw + tracker' }; $notes = @()
+                if ($s.Machine -gt 0) { $src += " #$($s.Machine)" }
+                if (-not $haveData) { $notes += "no raw data or tracker times for $($s.Label) - left as in the workbook"; $base = @($null, $null, $null, $null, $null, $null, $null) }
                 if ($row -eq 0) { $notes += "can't find 'Average time to start tool' in column C of $($s.Sheet)" }
                 $vals = @($base); $typedDays = @()
                 for ($d = 0; $d -lt $week.Days; $d++) {
                     $k = Get-TypedKey $s $week.Monday.AddDays($d)
                     if ($typed.Start.ContainsKey($k)) { $vals[$d] = $typed.Start[$k]; $typedDays += $d }
                 }
-                $startGrid[$s.Code] = [pscustomobject]@{ Values = $vals; Base = $base; Src = $src; Notes = $notes; Typed = $typedDays; Row = $row; FromTracker = ($mine.Count -gt 0) }
+                $startGrid[$s.Code] = [pscustomobject]@{ Values = $vals; Base = $base; Src = $src; Notes = $notes; Typed = $typedDays; Row = $row; FromData = $haveData }
             }
-            foreach ($t in $trackers) { Close-InputBook $t.Book }
+            Write-Host ''
+            Show-RawShiftTable $shops $rawStart $week
             while ($true) {
                 Write-Host ''
                 Show-StartGrid $shops $startGrid $week
-                Say "  Enter = OK.  Type over:  'hms tue 12' minutes | 'hms tue 6:25' clock time | 'fel wed na' | 'hms tue -' undo | 'undo hms'" DarkGray
+                Say "  Enter = OK.  Type over:  'hms tue 12' minutes | 'hms tue 6:25' clock time | 'fel wed na' | 'hms tue -' back to computed | 'undo hms'" DarkGray
                 $a = Ask 'Start times OK?'
                 if ($a -eq '') { break }
                 $m = [regex]::Match($a, '^(?i)undo\s+(\S+)$')
@@ -1620,6 +1938,7 @@ function Invoke-Report([string[]]$InputPaths, [switch]$PicturesOnly) {
                 $g.Values[$d] = $v; $typed.Start[$k] = $v
                 if ($g.Typed -notcontains $d) { $g.Typed += $d }
             }
+            Write-RawStartLog $cfg $shops $rawStart $week $typed
 
             Head "STEP 5 of $nSteps - Schedules (scheduled headcount)"
             $scDir = Get-Folder $cfg 'ScheduleFolder'
@@ -1662,20 +1981,37 @@ function Invoke-Report([string[]]$InputPaths, [switch]$PicturesOnly) {
                 $schedNow[$s.Code] = $vals
             }
 
-            Head "STEP 6 of $nSteps - Absent per shift"
+            Head "STEP 6 of $nSteps - Absent per shop"
 
-    if (AskYesNo "Scan Outlook for call-in voicemail MP3s?" $true) {
+    if ((Test-SettingYes $cfg 'CallInScan') -and (AskYesNo "Scan Outlook for call-in voicemail MP3s?" $false)) {
         try { Get-OutlookCallInAudio $cfg } catch { Warn "Call-in voicemail scan stopped: $($_.Exception.Message)" }
     }
 
-    $lastAbbr = $Script:DayAbbr[$week.Days - 1].ToLower()
+    # one number per shop per day: first the latest report day, shop by shop
+    $dLast = $week.Days - 1
+    $kDay = Format-Day $week.Monday.AddDays($dLast)
+    Say "  How many were absent on ${kDay}?   (number, Enter = keep [shown] / skip, - = clear)" DarkGray
+    foreach ($s in $shops) {
+        $k = Get-TypedKey $s $week.Monday.AddDays($dLast)
+        $cur = Get-AbsentTotal $typed.Absent[$k]
+        while ($true) {
+            $a = Ask ("  {0} absent {1}" -f $s.Label, $kDay) $(if ($null -ne $cur) { "$cur" } else { '' })
+            if ($a -eq '') { break }
+            if ($a -eq '-') { [void]$typed.Absent.Remove($k); break }
+            if ($a -match '^\d{1,3}$') { $typed.Absent[$k] = @([int]$a, $null, $null); break }
+            Say '  Just a number (e.g. 2), Enter, or -' Yellow
+        }
+    }
+    try { Save-Typed $typed } catch { }
+
+    # then the table, with edits like  hms mon 3
     while ($true) {
         Write-Host ''
         Show-AbsentGrid $shops $typed.Absent $schedNow $week
-        Say "  Enter = OK.  'hms 2 0 1' = by shift | 'hms mon 3' = total call-ins | 'hms mon -' = clear | 'clear hms'" DarkGray
+        Say "  Enter = OK.  'hms mon 3' = HMS Monday 3 absent | 'hms 3' = latest day | 'hms mon -' = clear | 'clear hms'" DarkGray
         $a = Ask 'Absences OK?'
         if ($a -eq '') { break }
-        
+
         $m = [regex]::Match($a, '^(?i)clear\s+(\S+)$')
         if ($m.Success) {
             $s = Find-Shop $shops $m.Groups[1].Value
@@ -1683,49 +2019,18 @@ function Invoke-Report([string[]]$InputPaths, [switch]$PicturesOnly) {
             for ($d = 0; $d -lt 7; $d++) { [void]$typed.Absent.Remove((Get-TypedKey $s $week.Monday.AddDays($d))) }
             continue
         }
-        
+
         $tok = @($a -split '\s+' | Where-Object { $_ -ne '' })
         $s = Find-Shop $shops $tok[0]
-        if ($null -eq $s -or $tok.Count -lt 2) { Say '  Start with the shop, e.g. hms 2 0 1  or  hms mon 3' Yellow; continue }
-        
-        $d = $week.Days - 1; $i = 1
-        if ((Get-DayIndex $tok[1]) -ge 0) { 
-            $d = Get-DayIndex $tok[1]; $i = 2 
-        }
+        if ($null -eq $s -or $tok.Count -lt 2) { Say '  Start with the shop, e.g. hms mon 3' Yellow; continue }
+        $d = $dLast; $i = 1
+        if ((Get-DayIndex $tok[1]) -ge 0) { $d = Get-DayIndex $tok[1]; $i = 2 }
         if ($d -ge $week.Days) { Say '  That day is after the report date.' Yellow; continue }
-        
-        $k = Get-TypedKey $s $week.Monday.AddDays($d)
         $rest = @($tok | Select-Object -Skip $i)
-        
-        if ($rest.Count -eq 1 -and $rest[0] -eq '-') { 
-            [void]$typed.Absent.Remove($k)
-            continue 
-        }
-        
-        # Check if user entered a single total number (e.g. "hms mon 3" or "hms 3")
-        if ($rest.Count -eq 1 -and $rest[0] -match '^\d+$') {
-            $totalVal = [int]$rest[0]
-            # Store as total in first shift slot or handle as single total
-            $typed.Absent[$k] = @($totalVal, $null, $null)
-            continue
-        }
-        
-        if ($rest.Count -lt 1 -or $rest.Count -gt 3 -or @($rest | Where-Object { $_ -notmatch '^(\d{1,3}|-|\.)$' }).Count -gt 0) { 
-            Say '  Give 1 to 3 numbers (shifts), a single total number, or - to clear.' Yellow
-            continue 
-        }
-        
-        $arr = @($null, $null, $null)
-        if ($typed.Absent.ContainsKey($k)) { 
-            $old = @($typed.Absent[$k])
-            for ($j = 0; $j -lt 3 -and $j -lt $old.Count; $j++) { $arr[$j] = $old[$j] } 
-        }
-        for ($j = 0; $j -lt $rest.Count; $j++) { 
-            if ($rest[$j] -match '^\d+$') { $arr[$j] = [int]$rest[$j] } 
-            else { $arr[$j] = $null } 
-        }
-        if (@($arr | Where-Object { $null -ne $_ }).Count -eq 0) { [void]$typed.Absent.Remove($k) } 
-        else { $typed.Absent[$k] = $arr }
+        if ($rest.Count -ne 1 -or $rest[0] -notmatch '^(\d{1,3}|-)$') { Say '  One number per day, e.g. hms mon 3  (or - to clear)' Yellow; continue }
+        $k = Get-TypedKey $s $week.Monday.AddDays($d)
+        if ($rest[0] -eq '-') { [void]$typed.Absent.Remove($k) } else { $typed.Absent[$k] = @([int]$rest[0], $null, $null) }
+        try { Save-Typed $typed } catch { }
     }
             try { Save-Typed $typed } catch { Say "  Couldn't save typed values: $($_.Exception.Message)" Yellow }
 
@@ -1801,7 +2106,7 @@ function Invoke-Report([string[]]$InputPaths, [switch]$PicturesOnly) {
             foreach ($s in $shops) {
                 $ws = $core[$s.Code].Ws; $g = $core[$s.Code].Grid
                 $sg = $startGrid[$s.Code]
-                if ($sg.Row -gt 0 -and ($sg.FromTracker -or $sg.Typed.Count -gt 0)) {
+                if ($sg.Row -gt 0 -and ($sg.FromData -or $sg.Typed.Count -gt 0)) {
                     for ($d = 0; $d -lt 7; $d++) {
                         if ($d -ge $week.Days) { Set-CellValue $ws $sg.Row (8 + 2 * $d) $null; continue }
                         $v = $sg.Values[$d]; if ($null -eq $v -or "$v" -eq '') { $v = 'N/A' }
@@ -1847,6 +2152,8 @@ function Invoke-Report([string[]]$InputPaths, [switch]$PicturesOnly) {
                 }
             }
         }
+
+        try { Set-AbsenteeismCheck $shops $core } catch { Warn "Absenteeism check: $($_.Exception.Message)" }
 
         Say '  Recalculating...' DarkGray
         $xl.Calculation = -4105
@@ -1904,6 +2211,10 @@ function Invoke-Report([string[]]$InputPaths, [switch]$PicturesOnly) {
             }
             $done = @($saved) + $done
         }
+        if ($mode -eq 1 -or $mode -eq 2) {
+            $pageWb = $null; if ($mode -eq 1) { $pageWb = $saved }
+            try { Publish-PageFolder $cfg $p2 $p1 $week $pageWb } catch { Warn "Updating the page failed: $($_.Exception.Message)" }
+        }
 
         Head 'Done'
         foreach ($p in $done) { Say "  $p" Green }
@@ -1913,13 +2224,151 @@ function Invoke-Report([string[]]$InputPaths, [switch]$PicturesOnly) {
             Say "  $($Script:Warn.Count) thing(s) to check:" Yellow
             foreach ($w in $Script:Warn) { Say "   - $w" Yellow }
         }
-        if ((Test-SettingYes $cfg 'OpenWhenDone') -and $mode -ne 3) { try { Invoke-Item -LiteralPath $outDir } catch { } }
+        if (Test-SettingYes $cfg 'OpenWhenDone') {
+            if ($mode -ne 3) { $openDir = $outDir }
+            if ($mode -ne 2) { $openWb = $saved }
+        }
     }
     finally {
         if ($null -ne $wb) { try { $wb.Close($false) } catch { } ; Remove-Com $wb }
         Stop-Excel $xl
         Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
     }
+    Open-WhenDone $openWb $openDir
+}
+
+# ---------- Daily Ops page on the J: drive ----------
+# The page that goes in the folder (rewritten on every publish, so it stays current)
+$Script:PageHtml = @'
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="180">
+<title>MS Daily Report</title>
+</head>
+<body>
+<p>MS Daily Report<br>
+updated __UPDATED__</p>
+__WORKBOOK__<p><a href="images/summary.png?v=__V__"><img src="images/summary.png?v=__V__" alt="Summary" style="max-width:100%"></a></p>
+<p><a href="images/all-shops.png?v=__V__"><img src="images/all-shops.png?v=__V__" alt="All shops" style="max-width:100%"></a></p>
+</body>
+</html>
+'@
+
+# write a file next to its final name first, then swap it in - people looking at the page never get half a picture.
+# Shared drives often allow writing but not deleting / renaming: then it just writes straight over the file.
+function Write-FileSafe([string]$Path, [byte[]]$Bytes) {
+    $tmp = $Path + '.tmp'
+    try {
+        [IO.File]::WriteAllBytes($tmp, $Bytes)
+        if (Test-Path -LiteralPath $Path) { [IO.File]::Replace($tmp, $Path, $null) } else { [IO.File]::Move($tmp, $Path) }
+        return
+    }
+    catch { if (Test-Path -LiteralPath $tmp -PathType Leaf) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } }
+    try {
+        if (Test-Path -LiteralPath $Path) { try { (Get-Item -LiteralPath $Path).IsReadOnly = $false } catch { } }
+        [IO.File]::WriteAllBytes($Path, $Bytes)
+    }
+    catch { throw "can't write $Path - $($_.Exception.Message)" }
+}
+
+# copies the 2 pictures + the page (with the time in it) into PageFolder (blank = off)
+# the workbook the page links to: the one just saved, else the last one linked (Saved\page-workbook.txt).
+# On the same drive as the page -> link straight to it; somewhere else (e.g. this PC) -> a copy goes in the page folder.
+function Get-PageWorkbookLink([string]$Dir, [string]$Workbook) {
+    $mem = Join-Path (Join-Path $Script:Root 'Saved') 'page-workbook.txt'
+    if ($Workbook -and (Test-Path -LiteralPath $Workbook)) {
+        try { New-Item -ItemType Directory -Force -Path (Split-Path -Parent $mem) | Out-Null; Set-Content -LiteralPath $mem -Value $Workbook } catch { }
+    }
+    elseif (Test-Path -LiteralPath $mem) { $Workbook = (Get-Content -LiteralPath $mem -Raw).Trim() }
+    if (-not $Workbook -or -not (Test-Path -LiteralPath $Workbook)) { return '' }
+    $target = $Workbook
+    if ([IO.Path]::GetPathRoot($Workbook) -ine [IO.Path]::GetPathRoot($Dir)) {
+        $target = Join-Path $Dir ('MS Daily Report' + [IO.Path]::GetExtension($Workbook))
+        Say "  Copying the workbook next to the page..." DarkGray
+        Write-FileSafe $target ([IO.File]::ReadAllBytes($Workbook))
+    }
+    $base = New-Object Uri ($Dir.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar)
+    $rel = $base.MakeRelativeUri((New-Object Uri $target)).ToString()                    # relative, so a different drive letter still works
+    $folderRel = $base.MakeRelativeUri((New-Object Uri ((Split-Path -Parent $target).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar))).ToString()
+    if ($folderRel -eq '') { $folderRel = './' }
+    $fileUri = (New-Object Uri $target).AbsoluteUri
+    $js = { param($u) [Net.WebUtility]::HtmlEncode($u.Replace("'", '%27').Replace('\\', '/')) }   # safe inside onclick='...'
+    $b = New-Object Text.StringBuilder
+    [void]$b.Append('<p>')
+    [void]$b.Append(('<button type="button" onclick="var a=document.createElement(''a'');a.href=''{0}'';a.download='''';document.body.appendChild(a);a.click();a.remove()">Download report</button> ' -f (& $js $rel)))
+    [void]$b.Append(('<button type="button" onclick="location.href=''ms-excel:ofv|u|{0}''">Open in Excel</button> ' -f (& $js $fileUri)))
+    [void]$b.Append(('<button type="button" onclick="location.href=''{0}''">Show folder</button>' -f (& $js $folderRel)))
+    [void]$b.Append(('<br>{0}</p>' -f [Net.WebUtility]::HtmlEncode($target)))
+    return $b.ToString() + "`n"
+}
+
+function Publish-PageFolder($Cfg, [string]$SummaryPng, [string]$ShopsPng, $Week, [string]$Workbook = '') {
+    $dir = (Get-Setting $Cfg 'PageFolder').Trim()
+    if ($dir -eq '') { return }
+    try {
+        $img = Join-Path $dir 'images'
+        try { New-Item -ItemType Directory -Force -Path $img | Out-Null } catch { throw "can't make the folder $img - $($_.Exception.Message)" }
+        Write-FileSafe (Join-Path $img 'summary.png') ([IO.File]::ReadAllBytes($SummaryPng))
+        Write-FileSafe (Join-Path $img 'all-shops.png') ([IO.File]::ReadAllBytes($ShopsPng))
+        $now = Get-Date
+        # the time goes inside index.html itself (shared drives often block .js / .json files); written last,
+        # so the time only changes once the pictures are there. ?v= makes browsers load the new pictures.
+        $wbLink = ''
+        try { $wbLink = Get-PageWorkbookLink $dir $Workbook } catch { Warn "Couldn't put the workbook link on the page: $($_.Exception.Message)" }
+        $html = $Script:PageHtml.Replace('__UPDATED__', $now.ToString('MM/dd/yyyy, h:mm tt', $Script:US)).Replace('__V__', $now.ToString('yyyyMMddHHmmss', $Script:Inv)).Replace('__WORKBOOK__', $wbLink)
+        Write-FileSafe (Join-Path $dir 'index.html') ([Text.Encoding]::UTF8.GetBytes($html))
+        Say "  Page updated: $(Join-Path $dir 'index.html')" Green
+    }
+    catch { Warn "Couldn't update the page: $($_.Exception.Message)  (check you can make and change files in that folder, or use another folder: set PageFolder ...)" }
+}
+
+# 'page' command: puts the newest pictures from the output folder on the page without a run
+function Invoke-PublishPage {
+    $cfg = Get-Config
+    if ((Get-Setting $cfg 'PageFolder') -eq '') { Say '  Set the folder first, e.g.  set PageFolder J:\Departments\Machine\4M\KACPER\DAILY OPS REPORTING\Daily Ops Page' Yellow; return }
+    $root = Get-OutputRoot $cfg
+    $sumP = @(Get-ChildItem -LiteralPath $root -Recurse -File -Filter 'Daily Ops Summary *.png' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)[0]
+    $shopP = @(Get-ChildItem -LiteralPath $root -Recurse -File -Filter 'Daily Ops All shops *.png' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)[0]
+    if ($null -eq $sumP -or $null -eq $shopP) { Say "  No pictures in $root yet - run the report first." Yellow; return }
+    $week = $null; $m = [regex]::Match($sumP.Name, '(\d{4}-\d{2}-\d{2})'); if ($m.Success) { $week = Get-ReportWeek ([datetime]::ParseExact($m.Groups[1].Value, 'yyyy-MM-dd', $Script:Inv)) }
+    Say "  $($sumP.Name) + $($shopP.Name)" DarkGray
+    $Script:Warn.Clear()
+    Publish-PageFolder $cfg $sumP.FullName $shopP.FullName $week
+}
+
+# Absenteeism % row on each Core sheet: negative -> 0%, 100% (no one entered as present) or no one scheduled -> N/A.
+# Goes into the row's formulas (Actual days + week column), so it also holds when numbers are typed in later.
+# Only the usual formulas are swapped:  =(Sched-Actual)/Sched  and  =IFERROR((Sched-Actual)/Sched,0);  week =AVERAGE(...) gets IFERROR(...,"N/A").
+function Set-AbsenteeismCheck($Shops, $Core) {
+    $changed = @()
+    foreach ($s in $Shops) {
+        $c = $Core[$s.Code]; if ($null -eq $c -or $null -eq $c.Ws) { continue }
+        $g = $c.Grid; $last = Get-LastRow $g
+        $r = Find-InCol $g 3 1 $last 'absente'                    # 'Absenteeism %' (also matches 'Absenteism')
+        $p = Find-InCol $g 3 1 $last '# of employee present'
+        if ($r -le 0 -or $p -le 0 -or $p -eq $r) { continue }
+        $o = $p - $r
+        $x = "(R[$o]C[-1]-R[$o]C)/R[$o]C[-1]"
+        $new = "=IFERROR(IF($x>=1,`"N/A`",MAX(0,$x)),`"N/A`")"
+        $old = @("=$x", "=IFERROR($x,0)") | ForEach-Object { ($_ -replace '\s', '').ToUpperInvariant() }
+        $n = 0
+        foreach ($col in @(8, 10, 12, 14, 16, 18, 20, 22)) {           # H J L N P R T (Actual) + V (week)
+            $cell = $c.Ws.Cells.Item($r, $col)
+            try {
+                $cur = "$($cell.FormulaR1C1)"
+                $k = ($cur -replace '\s', '').ToUpperInvariant()
+                $put = $null
+                if ($old -contains $k) { $put = $new }
+                elseif ($col -eq 22 -and $k.StartsWith('=AVERAGE(')) { $put = '=IFERROR(' + $cur.Trim().Substring(1) + ',"N/A")' }
+                if ($put) { $cell.FormulaR1C1 = [string]$put; $n++ }
+            }
+            finally { Remove-Com $cell }
+        }
+        if ($n -gt 0) { $changed += $s.Label }
+    }
+    if ($changed.Count -gt 0) { Say "  Absenteeism check added ($($changed -join ', ')): below 0 -> 0%, 100% -> N/A" DarkGray }
 }
 
 function Invoke-FormulaCheck($Wb, $Sum, [bool]$Fix) {
@@ -2077,6 +2526,7 @@ function Show-Help {
         @('forget', 'Clear typed start times/absences', ''),
         @('open config|output|report|backups', 'Open folder', ''),
         @('outlook [date]', 'Try the Outlook scan for the hours emails (report date, default today)', ''),
+        @('page', 'Put the newest 2 pictures on the J: page now', ''),
         @('help', 'This list', '?'),
         @('exit', 'Quit', 'q')
     )
@@ -2107,6 +2557,7 @@ function Invoke-OpsCommand([string]$Line) {
     switch ($cmd) {
         'run' { Invoke-Report @($rest | ForEach-Object { Clean-PathText $_ } | Where-Object { Test-Path -LiteralPath $_ }) }
         'pictures' { Invoke-Report @($rest | ForEach-Object { Clean-PathText $_ } | Where-Object { Test-Path -LiteralPath $_ }) -PicturesOnly }
+        'page' { Invoke-PublishPage }
         'outlook' {
             $cfg = Get-Config
             $rd = (Get-Date).Date; if ($restText) { $x = ConvertTo-DateNear $restText; if ($x) { $rd = $x } }
@@ -2160,7 +2611,7 @@ function Invoke-OpsCommand([string]$Line) {
 
 function Start-Repl {
     Say ''
-    Say '  CHICAGO DAILY OPS REPORT' Cyan
+    Say '  CHICAGO DAILY OPS REPORT  -  test version: start times from raw data + trackers' Cyan
     Say '  Press Enter to run the daily update, or type a command.' DarkGray
     while ($true) {
         Write-Host ''
